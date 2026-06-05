@@ -22,9 +22,10 @@ import (
 )
 
 type Model struct {
-	t     tree.Model
-	files []*gitdiff.File
-	cfg   config.Config
+	t           tree.Model
+	files       []*gitdiff.File
+	filterFiles []*gitdiff.File // non-nil when a filter is active; used instead of files
+	cfg         config.Config
 }
 
 func New(cfg config.Config) Model {
@@ -122,6 +123,20 @@ func (m Model) SetFiles(files []*gitdiff.File) Model {
 	return m
 }
 
+func (m *Model) SetFilteredFiles(files []*gitdiff.File) {
+	m.filterFiles = files
+	m.rebuildTree()
+	m.t.SetWidth(m.t.Width())
+	m.updateStyles()
+}
+
+func (m *Model) ClearFilter() {
+	m.filterFiles = nil
+	m.rebuildTree()
+	m.t.SetWidth(m.t.Width())
+	m.updateStyles()
+}
+
 func (m *Model) Down() {
 	m.t.Down()
 }
@@ -211,7 +226,11 @@ func (m *Model) SetCursorByPath(path string) {
 }
 
 func (m *Model) rebuildTree() {
-	t := buildFullFileTree(m.files, m.cfg)
+	files := m.files
+	if m.filterFiles != nil {
+		files = m.filterFiles
+	}
+	t := buildFullFileTree(files, m.cfg)
 	t = collapseTree(t)
 	t, _ = truncateTree(t, 0, 0, 0, m.cfg, m.t.Width())
 	m.t.SetNodes(t)

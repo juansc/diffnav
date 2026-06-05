@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"os/exec"
@@ -33,10 +34,11 @@ import (
 )
 
 const (
-	minResizeStep = 6
-	footerHeight  = 1
-	headerHeight  = 2
-	searchHeight  = 3
+	minResizeStep   = 6
+	footerHeight    = 1
+	headerHeight    = 2
+	searchHeight    = 3
+	filterBarHeight = 1
 
 	// Zone IDs for bubblezone click detection.
 	zoneSearchBox     = "searchbox"
@@ -78,6 +80,9 @@ type mainModel struct {
 	resultsCursor     int
 	searching         bool
 	filtered          []string
+	filtering         bool
+	filterQuery       string
+	filterInput       textinput.Model
 	config            config.Config
 	draggingSidebar   bool
 	iconStyle         string
@@ -135,6 +140,17 @@ func New(input string, cfg config.Config) mainModel {
 
 	m.resultsVp = viewport.Model{}
 
+	m.filterInput = textinput.New()
+	m.filterInput.Prompt = "/ "
+	m.filterInput.Placeholder = "filter tree..."
+	m.filterInput.SetWidth(cfg.UI.FileTreeWidth - 2)
+	m.filterInput.SetStyles(textinput.Styles{
+		Focused: textinput.StyleState{
+			Placeholder: lipgloss.NewStyle().Foreground(lipgloss.Color("8")),
+			Prompt:      lipgloss.NewStyle().Foreground(lipgloss.Color("4")),
+		},
+	})
+
 	return m
 }
 
@@ -190,6 +206,13 @@ func (m mainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(cmds...)
 	}
 
+	if m.filtering {
+		var fCmds []tea.Cmd
+		m, fCmds = m.filterUpdate(msg)
+		cmds = append(cmds, fCmds...)
+		return m, tea.Batch(cmds...)
+	}
+
 	switch msg := msg.(type) {
 	case tea.KeyPressMsg:
 		switch {
@@ -241,6 +264,14 @@ func (m mainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			dfCmd := m.diffViewer.SetSize(m.width-m.sidebarWidth(), m.mainContentHeight())
 			cmds = append(cmds, dfCmd, m.search.Focus())
+		case key.Matches(msg, keys.Filter):
+			if m.isShowingFileTree {
+				m.filtering = true
+				m.filterInput.SetValue(m.filterQuery)
+				m.filterInput.SetWidth(m.filterInputWidth())
+				m.fileTree.SetSize(m.sidebarWidth(), m.treeHeight())
+				cmds = append(cmds, m.filterInput.Focus())
+			}
 		case key.Matches(msg, keys.ToggleFileTree):
 			m.isShowingFileTree = !m.isShowingFileTree
 			sidebarWidth := m.sidebarWidth()
@@ -339,10 +370,10 @@ func (m mainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		dfCmd := m.diffViewer.SetSize(m.width-m.sidebarWidth(), m.mainContentHeight())
 		cmds = append(cmds, dfCmd)
 
-		tWidth, tHeight := m.sidebarWidth(), m.mainContentHeight()-searchHeight
-
-		m.fileTree.SetSize(tWidth, tHeight)
+		tWidth := m.sidebarWidth()
+		m.fileTree.SetSize(tWidth, m.treeHeight())
 		m.search.SetWidth(m.searchWidth())
+		m.filterInput.SetWidth(m.filterInputWidth())
 		if m.messageOpen {
 			m.updateMessageVp()
 		}
@@ -380,6 +411,9 @@ func (m mainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		}
 		m.fileTree = m.fileTree.SetFiles(m.files)
+		if m.filterQuery != "" {
+			m.applyFilter()
+		}
 		m.preamble = strings.TrimSpace(msg.preamble)
 		m.commitBranch = msg.branch
 		m.cachedMeta = m.parseCommitMeta()
@@ -531,14 +565,20 @@ func (m mainModel) View() tea.View {
 			Render(m.search.View())
 		searchBox = zone.Mark(zoneSearchBox, searchBox)
 
-		content := ""
+		treeContent := ""
 		if m.searching {
-			content = zone.Mark(zoneSearchResults, m.resultsVp.View())
+			treeContent = zone.Mark(zoneSearchResults, m.resultsVp.View())
 		} else {
-			content = zone.Mark(zoneFileTree, m.fileTree.View())
+			treeContent = zone.Mark(zoneFileTree, m.fileTree.View())
 		}
-		content = lipgloss.NewStyle().
-			Render(lipgloss.JoinVertical(lipgloss.Left, searchBox, content))
+
+		sidebarParts := []string{searchBox}
+		if m.filterBarVisible() {
+			sidebarParts = append(sidebarParts, m.filterBarView())
+		}
+		sidebarParts = append(sidebarParts, treeContent)
+		content := lipgloss.NewStyle().
+			Render(lipgloss.JoinVertical(lipgloss.Left, sidebarParts...))
 
 		sidebar = lipgloss.NewStyle().
 			Border(lipgloss.NormalBorder(), false, true, false, false).
@@ -739,7 +779,7 @@ func (m mainModel) viewHeader() string {
 	title := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("6")).
 		Bold(true).
-		Render("DIFFNAV")
+		Render("DIFFNAVME - 👀")
 
 	sep := lipgloss.NewStyle().Foreground(lipgloss.BrightBlack).Render(" • ")
 	hashStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("132"))
@@ -985,6 +1025,94 @@ func (m *mainModel) stopSearch() {
 	m.search.SetValue("")
 	m.search.Blur()
 	m.search.SetWidth(m.searchWidth())
+}
+
+func (m mainModel) filterBarVisible() bool {
+	return !m.searching && (m.filtering || m.filterQuery != "")
+}
+
+func (m mainModel) treeHeight() int {
+	h := m.mainContentHeight() - searchHeight
+	if m.filterBarVisible() {
+		h -= filterBarHeight
+	}
+	return h
+}
+
+func (m *mainModel) filterInputWidth() int {
+	return max(0, m.sidebarWidth()-2)
+}
+
+func (m mainModel) filterBarView() string {
+	w := max(0, m.sidebarWidth()-1)
+	if m.filtering {
+		return lipgloss.NewStyle().Width(w).Render(m.filterInput.View())
+	}
+	return lipgloss.NewStyle().
+		Width(w).
+		Foreground(lipgloss.Color("8")).
+		Render("/ " + m.filterQuery)
+}
+
+func (m *mainModel) applyFilter() {
+	candidates := make([]string, len(m.files))
+	for i, f := range m.files {
+		candidates[i] = filenode.GetFileName(f)
+	}
+	matched := fzfMatchList(m.filterQuery, candidates)
+	matchSet := make(map[string]struct{}, len(matched))
+	for _, name := range matched {
+		matchSet[name] = struct{}{}
+	}
+	filtered := make([]*gitdiff.File, 0, len(matched))
+	for _, f := range m.files {
+		if _, ok := matchSet[filenode.GetFileName(f)]; ok {
+			filtered = append(filtered, f)
+		}
+	}
+	m.fileTree.SetFilteredFiles(filtered)
+}
+
+func (m mainModel) filterUpdate(msg tea.Msg) (mainModel, []tea.Cmd) {
+	var cmds []tea.Cmd
+
+	if m.filterInput.Focused() {
+		switch msg := msg.(type) {
+		case tea.KeyMsg:
+			switch msg.String() {
+			case "esc":
+				m.filtering = false
+				m.filterInput.Blur()
+				m.filterInput.SetValue(m.filterQuery)
+				m.fileTree.SetSize(m.sidebarWidth(), m.treeHeight())
+			case "ctrl+c":
+				return m, []tea.Cmd{tea.Quit}
+			case "enter":
+				m.filterQuery = m.filterInput.Value()
+				m.filtering = false
+				m.filterInput.Blur()
+				if m.filterQuery == "" {
+					m.fileTree.ClearFilter()
+				} else {
+					m.applyFilter()
+				}
+				m.fileTree.SetSize(m.sidebarWidth(), m.treeHeight())
+				m.fileTree.GoToTop()
+				node := m.fileTree.GetCurrNode()
+				var cmd tea.Cmd
+				m, cmd = m.setNodeDiff(node)
+				cmds = append(cmds, cmd)
+				dfCmd := m.diffViewer.SetSize(m.width-m.sidebarWidth(), m.mainContentHeight())
+				cmds = append(cmds, dfCmd)
+			}
+		}
+
+		fi, fiCmd := m.filterInput.Update(msg)
+		m.filterInput = fi
+		cmds = append(cmds, fiCmd)
+	}
+
+	return m, cmds
 }
 
 func (m mainModel) openInEditor() tea.Cmd {
@@ -1359,16 +1487,58 @@ func (m mainModel) setNodeDiff(node *tree.Node) (mainModel, tea.Cmd) {
 	return m, cmd
 }
 
-func (m *mainModel) setSearchResults() {
-	filtered := make([]string, 0)
-	for _, f := range m.files {
-		if strings.Contains(
-			strings.ToLower(filenode.GetFileName(f)),
-			strings.ToLower(m.search.Value()),
-		) {
-			filtered = append(filtered, filenode.GetFileName(f))
+func fzfMatchList(filterValue string, files []string) []string {
+	// Pass the files to fzf using the pattern matching
+	input := strings.Join(files, "\n")
+	cmd := exec.Command("fzf", fmt.Sprintf("--filter=%s", filterValue))
+	cmd.Stdin = strings.NewReader(input)
+
+	// Capture the matched output and errors
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	// Run the command
+	err := cmd.Run()
+	if err != nil {
+		// Exit code 1 means no match was found, which is a normal search result
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+			return []string{}
+		}
+		return nil
+	}
+
+	// Split the filtered output back into a slice
+	output := strings.TrimSpace(stdout.String())
+	if output == "" {
+		return []string{}
+	}
+
+	// Collect the items into a map
+	outputMatches := strings.Split(output, "\n")
+	matches := map[string]struct{}{}
+	for _, m := range outputMatches {
+		matches[m] = struct{}{}
+	}
+
+	// Iterate over original input to match
+	matchedFiles := make([]string, 0, len(files))
+	for _, f := range files {
+		if _, ok := matches[f]; ok {
+			matchedFiles = append(matchedFiles, f)
 		}
 	}
+	return matchedFiles
+}
+
+func (m *mainModel) setSearchResults() {
+	candidates := make([]string, len(m.files))
+	for i, f := range m.files {
+		candidates[i] = filenode.GetFileName(f)
+	}
+
+	filtered := fzfMatchList(m.search.Value(), candidates)
+
 	m.filtered = filtered
 	switch {
 	case len(m.filtered) == 0:

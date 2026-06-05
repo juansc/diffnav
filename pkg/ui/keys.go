@@ -24,6 +24,7 @@ type KeyMap struct {
 	ToggleIconStyle key.Binding
 	ToggleHelp      key.Binding
 	ToggleMessage   key.Binding
+	Filter          key.Binding
 }
 
 var keys = &KeyMap{
@@ -111,6 +112,10 @@ var keys = &KeyMap{
 		key.WithKeys("m"),
 		key.WithHelp("m", "commit info"),
 	),
+	Filter: key.NewBinding(
+		key.WithKeys("/"),
+		key.WithHelp("/", "filter tree"),
+	),
 }
 
 func KeyGroups() [][]key.Binding {
@@ -127,6 +132,7 @@ func KeyGroups() [][]key.Binding {
 	}, {
 		keys.ToggleFileTree,
 		keys.Search,
+		keys.Filter,
 		keys.Copy,
 		keys.OpenInEditor,
 		keys.ToggleDiffView,
