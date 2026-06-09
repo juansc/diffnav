@@ -1098,6 +1098,7 @@ func (m mainModel) filterUpdate(msg tea.Msg) (mainModel, []tea.Cmd) {
 				}
 				m.fileTree.SetSize(m.sidebarWidth(), m.treeHeight())
 				m.fileTree.GoToTop()
+				m.diffViewer.ClearCache()
 				node := m.fileTree.GetCurrNode()
 				var cmd tea.Cmd
 				m, cmd = m.setNodeDiff(node)
